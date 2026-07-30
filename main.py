@@ -6,17 +6,15 @@ import requests
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# Visa Norvēģija, visas markas
-# Maks. cena: 200 000 NOK
-# Min. gads: 1880
 FINN_URL = os.getenv(
     "FINN_URL",
     "https://www.finn.no/mobility/search/car"
+    "?price_to=200000"
+    "&sales_form=1"
+    "&sort=PUBLISHED_DESC"
 )
 
-CHECK_EVERY_SECONDS = 60
-MAX_PRICE = 200000
-MIN_YEAR = 1880
+CHECK_EVERY_SECONDS = 2
 
 seen = set()
 
@@ -24,19 +22,28 @@ seen = set()
 def get_ads():
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.0.0 Safari/537.36"
         )
     }
 
-    response = requests.get(FINN_URL, headers=headers, timeout=20)
+    response = requests.get(
+        FINN_URL,
+        headers=headers,
+        timeout=20
+    )
+
     response.raise_for_status()
 
-    # Atrodam FINN auto sludinājumu ID
-    ids = re.findall(r"/mobility/item/(\d+)", response.text)
+    ids = re.findall(
+        r"/mobility/item/(\d+)",
+        response.text
+    )
 
-    # Saglabājam secību un noņemam dublikātus
-    return list(dict.fromkeys(ids))
+    unique_ids = list(dict.fromkeys(ids))
+
+    return unique_ids[:50]
 
 
 def send_telegram(text):
@@ -51,36 +58,45 @@ def send_telegram(text):
         },
         timeout=20,
     )
+
     response.raise_for_status()
 
 
 def main():
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("BOT_TOKEN vai CHAT_ID nav uzstādīts Railway.")
+        raise RuntimeError(
+            "BOT_TOKEN vai CHAT_ID nav uzstādīts Railway."
+        )
 
-    # Startējot botu, esošos sludinājumus atceramies,
-    # bet NESŪTĀM Telegram. Tādēļ vecie vairs nenāks.
+    print("FINN Auto Alert startējas...", flush=True)
+
+    # Startējot neko vecu nesūtām
     initial_ads = get_ads()
     seen.update(initial_ads)
 
+    print(
+        f"Sākumā atcerēti {len(initial_ads)} sludinājumi.",
+        flush=True
+    )
+
     send_telegram(
-        "🚗 FINN Auto Alert palaists!\n"
-        "Skatos tikai jaunus sludinājumus pēc bota palaišanas.\n"
-        "Cena līdz 200 000 kr • visa Norvēģija • visas markas."
+        "🚗 FINN Auto Alert palaists!\n\n"
+        "Pārbaudu FINN ik pēc 2 sekundēm.\n"
+        "Sūtu tikai jaunus sludinājumus.\n"
+        "Cena līdz 200 000 kr."
     )
 
     while True:
         try:
             current_ads = get_ads()
 
-            # reversed, lai jaunākos nosūtītu saprotamā secībā
             new_ads = [
                 ad_id
-                for ad_id in reversed(current_ads)
+                for ad_id in current_ads
                 if ad_id not in seen
             ]
 
-            for ad_id in new_ads:
+            for ad_id in reversed(new_ads):
                 link = f"https://www.finn.no/mobility/item/{ad_id}"
 
                 send_telegram(
@@ -90,11 +106,19 @@ def main():
 
                 seen.add(ad_id)
 
-            # Atceramies arī pārējos pašreiz redzamos
             seen.update(current_ads)
 
+            print(
+                f"Pārbaudīts: {len(current_ads)} | "
+                f"Jauni: {len(new_ads)}",
+                flush=True
+            )
+
         except Exception as error:
-            print(f"Error: {error}", flush=True)
+            print(
+                f"Error: {error}",
+                flush=True
+            )
 
         time.sleep(CHECK_EVERY_SECONDS)
 
