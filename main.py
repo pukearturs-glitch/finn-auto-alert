@@ -13,15 +13,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 CHECK_EVERY_SECONDS = 2
 NORWAY_TZ = ZoneInfo("Europe/Oslo")
 
-FINN_URL = (
-    "https://www.finn.no/mobility/search/car"
-    "?price_to=200000"
-    "&sales_form=1"
-    "&published=1"
-    "&sort=PUBLISHED_DESC"
-)
-
-SENT_FILE = "sent_ids.txt"
+BASE_URL = "https://www.finn.no/mobility/search/car"
 
 session = requests.Session()
 session.headers.update({
@@ -32,50 +24,29 @@ session.headers.update({
     )
 })
 
-
-NORWEGIAN_MONTHS = {
-    "januar": 1,
-    "februar": 2,
-    "mars": 3,
-    "april": 4,
-    "mai": 5,
-    "juni": 6,
-    "juli": 7,
-    "august": 8,
-    "september": 9,
-    "oktober": 10,
-    "november": 11,
-    "desember": 12,
-}
+seen = set()
+sent = set()
 
 
 def norway_today():
     return datetime.now(NORWAY_TZ).date()
 
 
-def load_sent_ids():
-    if not os.path.exists(SENT_FILE):
-        return set()
-
-    with open(SENT_FILE, "r", encoding="utf-8") as f:
-        return {
-            line.strip()
-            for line in f
-            if line.strip()
-        }
-
-
-def save_sent_id(ad_id):
-    with open(SENT_FILE, "a", encoding="utf-8") as f:
-        f.write(ad_id + "\n")
-        f.flush()
+def build_search_url(page=1):
+    return (
+        f"{BASE_URL}"
+        f"?price_to=200000"
+        f"&sales_form=1"
+        f"&published=1"
+        f"&sort=PUBLISHED_DESC"
+        f"&page={page}"
+    )
 
 
-sent = load_sent_ids()
+def get_page_ads(page):
+    url = build_search_url(page)
 
-
-def get_ads():
-    response = session.get(FINN_URL, timeout=20)
+    response = session.get(url, timeout=20)
     response.raise_for_status()
 
     ids = re.findall(
@@ -86,59 +57,72 @@ def get_ads():
     return list(dict.fromkeys(ids))
 
 
-def parse_updated_date(text):
-    match = re.search(
-        r"Sist oppdatert\s+"
-        r"(\d{1,2})\.\s+"
-        r"([A-Za-zæøåÆØÅ]+)\s+"
-        r"(\d{4})",
-        text,
-        re.IGNORECASE
-    )
+def get_all_today_ads():
+    all_ids = []
+    known = set()
 
-    if not match:
-        return None
+    # FINN dokumentācija norāda līdz 50 lapām.
+    for page in range(1, 51):
+        ids = get_page_ads(page)
 
-    day = int(match.group(1))
-    month_name = match.group(2).lower()
-    year = int(match.group(3))
+        if not ids:
+            break
 
-    month = NORWEGIAN_MONTHS.get(month_name)
+        new_on_page = [
+            ad_id
+            for ad_id in ids
+            if ad_id not in known
+        ]
 
-    if not month:
-        return None
+        if not new_on_page:
+            break
 
-    return datetime(
-        year,
-        month,
-        day,
-        tzinfo=NORWAY_TZ
-    ).date()
+        for ad_id in new_on_page:
+            known.add(ad_id)
+            all_ids.append(ad_id)
+
+        print(
+            f"Starta scan: lapa {page}, kopā {len(all_ids)}",
+            flush=True
+        )
+
+        # Nedaudz saudzējam FINN startup laikā
+        time.sleep(0.3)
+
+    return all_ids
+
+
+def get_latest_ads():
+    latest = []
+
+    # Ikdienas darbībā pārbaudām tikai pirmās 2 lapas,
+    # jo tās ir sakārtotas PUBLISHED_DESC.
+    for page in (1, 2):
+        ids = get_page_ads(page)
+
+        for ad_id in ids:
+            if ad_id not in latest:
+                latest.append(ad_id)
+
+    return latest
 
 
 def is_private_seller(text):
     text_lower = text.lower()
 
-    # uzņēmuma/tirgotāja pazīmes
-    dealer_markers = [
-        "merkeforhandler",
-        "bilforhandler",
-        "forhandler",
-        "organisasjonsnummer",
-        "org.nr",
-        "org nr",
-    ]
-
-    if any(marker in text_lower for marker in dealer_markers):
+    # Meklējam sludinājuma pārdevēja tipu.
+    # FINN rezultātos privātie tiek atzīmēti kā "Privat".
+    if "merkeforhandler" in text_lower:
         return False
 
-    # privātā pārdevēja pazīmes
-    private_markers = [
-        "privat",
-        "privat selger",
-    ]
+    if "forhandler" in text_lower:
+        return False
 
-    return any(marker in text_lower for marker in private_markers)
+    if "privat" in text_lower:
+        return True
+
+    # Ja nevaram droši noteikt, nesūtām.
+    return False
 
 
 def get_ad_info(ad_id):
@@ -178,13 +162,11 @@ def get_ad_info(ad_id):
             price = f"{number} kr"
             break
 
-    updated_date = parse_updated_date(text)
     private = is_private_seller(text)
 
     return {
         "title": title,
         "price": price,
-        "updated_date": updated_date,
         "private": private,
         "url": url,
     }
@@ -209,77 +191,82 @@ def send_telegram(text):
     response.raise_for_status()
 
 
+def initialize_today():
+    print(
+        "Skenēju VISUS jau esošos šodienas sludinājumus...",
+        flush=True
+    )
+
+    existing = get_all_today_ads()
+
+    seen.update(existing)
+    sent.update(existing)
+
+    print(
+        f"Startā iegaumēti {len(existing)} sludinājumi.",
+        flush=True
+    )
+
+
 def main():
+    global seen, sent
+
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError(
             "BOT_TOKEN vai CHAT_ID nav uzstādīts Railway."
         )
 
-    today = norway_today()
+    current_day = norway_today()
 
-    # STARTĀ VISUS ŠODIENAS ESOŠOS SLUDINĀJUMUS
-    # IEGAUMĒJAM UN NESŪTĀM
-    initial_ads = get_ads()
-
-    for ad_id in initial_ads:
-        if ad_id not in sent:
-            sent.add(ad_id)
-            save_sent_id(ad_id)
+    # SVARĪGĀKAIS:
+    # palaišanas brīdī iegaumējam VISUS šodien jau esošos.
+    initialize_today()
 
     send_telegram(
         "✅ FINN Auto Sniper palaists!\n\n"
         "🔎 Pārbaude ik pēc 2 sekundēm\n"
         "👤 Tikai privātie pārdevēji\n"
-        "📅 Tikai jauni šodienas sludinājumi\n"
-        "💰 Cena līdz 200 000 kr"
+        "💰 Cena līdz 200 000 kr\n"
+        "🚗 Sūtu tikai tos, kas parādās pēc bota palaišanas"
     )
-
-    current_day = today
 
     while True:
         try:
             today = norway_today()
 
-            # ja sākusies jauna diena
+            # Ja Norvēģijā sākusies jauna diena
             if today != current_day:
                 current_day = today
 
-                # pusnaktī visus tobrīd esošos iegaumējam,
-                # lai nepienāk veci auto
-                midnight_ads = get_ads()
+                seen.clear()
+                sent.clear()
 
-                for ad_id in midnight_ads:
-                    if ad_id not in sent:
-                        sent.add(ad_id)
-                        save_sent_id(ad_id)
+                # Pusnaktī iegaumējam visu, kas jau ir rezultātos,
+                # lai nekas vecs neuzpeld vēlāk.
+                initialize_today()
 
-            current_ads = get_ads()
+            current_ads = get_latest_ads()
 
-            for ad_id in current_ads:
+            new_ads = [
+                ad_id
+                for ad_id in current_ads
+                if ad_id not in seen
+                and ad_id not in sent
+            ]
 
-                if ad_id in sent:
-                    continue
+            # Visus pašreiz redzamos iegaumējam
+            seen.update(current_ads)
 
-                # REZERVĒJAM PIRMS apstrādes
-                # lai vienu ID nevar paņemt 2x
-                sent.add(ad_id)
-                save_sent_id(ad_id)
-
+            for ad_id in reversed(new_ads):
                 try:
+                    # Rezervējam PIRMS sūtīšanas
+                    sent.add(ad_id)
+
                     info = get_ad_info(ad_id)
 
-                    # tikai šodien
-                    if info["updated_date"] != today:
-                        print(
-                            f"Ignorēts vecs: {ad_id}",
-                            flush=True
-                        )
-                        continue
-
-                    # tikai privātie
                     if not info["private"]:
                         print(
-                            f"Ignorēts tirgotājs: {ad_id}",
+                            f"Ignorēts ne-privāts: {ad_id}",
                             flush=True
                         )
                         continue
@@ -288,8 +275,7 @@ def main():
                         "🚨 JAUNS FINN AUTO!\n\n"
                         f"🚗 {info['title']}\n"
                         f"💰 {info['price']}\n"
-                        f"👤 Privāts pārdevējs\n"
-                        f"📅 {today.strftime('%d.%m.%Y')}\n\n"
+                        f"👤 Privāts pārdevējs\n\n"
                         f"{info['url']}"
                     )
 
@@ -302,7 +288,7 @@ def main():
 
                 except Exception as ad_error:
                     print(
-                        f"Kļūda {ad_id}: {ad_error}",
+                        f"Kļūda sludinājumam {ad_id}: {ad_error}",
                         flush=True
                     )
 
@@ -310,7 +296,7 @@ def main():
             status = error.response.status_code
 
             print(
-                f"HTTP kļūda: {status}",
+                f"FINN HTTP kļūda: {status}",
                 flush=True
             )
 
