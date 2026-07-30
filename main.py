@@ -10,11 +10,6 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# FINN:
-# - lietoti auto
-# - līdz 200 000 NOK
-# - tikai "Nye i dag"
-# - jaunākie vispirms
 FINN_URL = os.getenv(
     "FINN_URL",
     "https://www.finn.no/mobility/search/car"
@@ -25,7 +20,6 @@ FINN_URL = os.getenv(
 )
 
 CHECK_EVERY_SECONDS = 2
-
 NORWAY_TZ = ZoneInfo("Europe/Oslo")
 
 session = requests.Session()
@@ -39,6 +33,7 @@ session.headers.update({
 })
 
 seen = set()
+sent = set()
 
 NORWEGIAN_MONTHS = {
     "januar": 1,
@@ -61,11 +56,7 @@ def norway_today():
 
 
 def get_ads():
-    response = session.get(
-        FINN_URL,
-        timeout=20
-    )
-
+    response = session.get(FINN_URL, timeout=20)
     response.raise_for_status()
 
     ids = re.findall(
@@ -73,9 +64,7 @@ def get_ads():
         response.text
     )
 
-    unique_ids = list(dict.fromkeys(ids))
-
-    return unique_ids[:100]
+    return list(dict.fromkeys(ids))[:100]
 
 
 def parse_updated_date(text):
@@ -108,38 +97,49 @@ def parse_updated_date(text):
     ).date()
 
 
+def is_private_seller(soup, text):
+    text_lower = text.lower()
+
+    # Ja lapā skaidri redzam tirgotāja pazīmes, ignorējam.
+    dealer_markers = [
+        "forhandler",
+        "org.nr",
+        "organisasjonsnummer",
+        "bedrift",
+        "bilforhandler",
+    ]
+
+    if any(marker in text_lower for marker in dealer_markers):
+        return False
+
+    # FINN privātajiem sludinājumiem parasti ir Privat/Privat selger pazīmes.
+    private_markers = [
+        "privat selger",
+        "privat",
+    ]
+
+    if any(marker in text_lower for marker in private_markers):
+        return True
+
+    # Ja nav iespējams droši noteikt, NESŪTĀM.
+    return False
+
+
 def get_ad_info(ad_id):
     url = f"https://www.finn.no/mobility/item/{ad_id}"
 
-    response = session.get(
-        url,
-        timeout=20
-    )
-
+    response = session.get(url, timeout=20)
     response.raise_for_status()
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser"
-    )
+    soup = BeautifulSoup(response.text, "html.parser")
+    text = soup.get_text(" ", strip=True)
 
-    text = soup.get_text(
-        " ",
-        strip=True
-    )
-
-    # NOSAUKUMS
     title = "FINN auto"
 
     h1 = soup.find("h1")
-
     if h1:
-        title = h1.get_text(
-            " ",
-            strip=True
-        )
+        title = h1.get_text(" ", strip=True)
 
-    # CENA
     price = "Cena nav atrasta"
 
     price_patterns = [
@@ -164,11 +164,13 @@ def get_ad_info(ad_id):
             break
 
     updated_date = parse_updated_date(text)
+    private = is_private_seller(soup, text)
 
     return {
         "title": title,
         "price": price,
         "updated_date": updated_date,
+        "private": private,
         "url": url,
     }
 
@@ -198,59 +200,35 @@ def main():
             "BOT_TOKEN vai CHAT_ID nav uzstādīts Railway."
         )
 
-    print(
-        "FINN Auto Sniper startējas...",
-        flush=True
-    )
-
-    # Visus sludinājumus, kas jau ir meklēšanā
-    # starta brīdī, ignorējam.
     initial_ads = get_ads()
 
     seen.update(initial_ads)
+    sent.update(initial_ads)
 
     current_day = norway_today()
-
-    print(
-        f"Norvēģijas datums: {current_day}",
-        flush=True
-    )
-
-    print(
-        f"Startā ignorēti {len(initial_ads)} esošie sludinājumi.",
-        flush=True
-    )
 
     send_telegram(
         "✅ FINN Auto Sniper palaists!\n\n"
         "🔎 Pārbaude ik pēc 2 sekundēm\n"
+        "👤 Tikai privātie pārdevēji\n"
         "📅 Tikai šodienas sludinājumi\n"
-        "💰 Cena līdz 200 000 kr\n"
-        "🇳🇴 Datums pēc Norvēģijas laika"
+        "💰 Cena līdz 200 000 kr"
     )
 
     while True:
         try:
             today = norway_today()
 
-            # Ja pienākusi jauna diena
             if today != current_day:
-
-                print(
-                    f"Jauna diena: {today}",
-                    flush=True
-                )
-
                 current_day = today
 
-                # Iztīrām seen, bet visus sludinājumus,
-                # kas jau eksistē tieši pusnakts brīdī,
-                # uzreiz iegaumējam un nesūtām.
                 seen.clear()
+                sent.clear()
 
                 midnight_ads = get_ads()
 
                 seen.update(midnight_ads)
+                sent.update(midnight_ads)
 
             current_ads = get_ads()
 
@@ -258,34 +236,41 @@ def main():
                 ad_id
                 for ad_id in current_ads
                 if ad_id not in seen
+                and ad_id not in sent
             ]
 
-            # Uzreiz iegaumējam visus ID
             seen.update(current_ads)
 
             for ad_id in reversed(new_ads):
-
                 try:
+                    # REZERVĒJAM ID PIRMS jebkādas sūtīšanas.
+                    # Tas neļauj tam pašam ID aiziet 2x.
+                    sent.add(ad_id)
+
                     info = get_ad_info(ad_id)
 
-                    # SVARĪGĀKAIS FILTRS:
-                    # ja FINN datums nav ŠODIENA,
-                    # Telegram neko nesūtām.
+                    # Tikai šodienas
                     if info["updated_date"] != today:
-
                         print(
-                            f"Ignorēts vecs sludinājums: "
-                            f"{ad_id} | "
+                            f"Ignorēts datums: {ad_id} | "
                             f"{info['updated_date']}",
                             flush=True
                         )
+                        continue
 
+                    # Tikai privātie
+                    if not info["private"]:
+                        print(
+                            f"Ignorēts tirgotājs: {ad_id}",
+                            flush=True
+                        )
                         continue
 
                     message = (
                         "🚨 JAUNS FINN AUTO!\n\n"
                         f"🚗 {info['title']}\n"
                         f"💰 {info['price']}\n"
+                        f"👤 Privāts pārdevējs\n"
                         f"📅 {today.strftime('%d.%m.%Y')}\n\n"
                         f"{info['url']}"
                     )
@@ -293,36 +278,28 @@ def main():
                     send_telegram(message)
 
                     print(
-                        f"NOSŪTĪTS: {ad_id} | "
-                        f"{info['title']} | "
-                        f"{info['price']}",
+                        f"NOSŪTĪTS: {ad_id}",
                         flush=True
                     )
 
                 except Exception as ad_error:
-
                     print(
-                        f"Kļūda sludinājumam "
-                        f"{ad_id}: {ad_error}",
+                        f"Kļūda {ad_id}: {ad_error}",
                         flush=True
                     )
 
         except requests.HTTPError as error:
-
             status = error.response.status_code
 
             print(
-                f"FINN HTTP kļūda: {status}",
+                f"HTTP kļūda: {status}",
                 flush=True
             )
 
-            # Ja FINN sāk ierobežot pieprasījumus,
-            # pagaidām mazliet ilgāk.
             if status in (403, 429):
                 time.sleep(60)
 
         except Exception as error:
-
             print(
                 f"Galvenā kļūda: {error}",
                 flush=True
