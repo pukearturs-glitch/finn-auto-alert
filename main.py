@@ -10,8 +10,10 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-FINN_URL = os.getenv(
-    "FINN_URL",
+CHECK_EVERY_SECONDS = 2
+NORWAY_TZ = ZoneInfo("Europe/Oslo")
+
+FINN_URL = (
     "https://www.finn.no/mobility/search/car"
     "?price_to=200000"
     "&sales_form=1"
@@ -19,11 +21,9 @@ FINN_URL = os.getenv(
     "&sort=PUBLISHED_DESC"
 )
 
-CHECK_EVERY_SECONDS = 2
-NORWAY_TZ = ZoneInfo("Europe/Oslo")
+SENT_FILE = "sent_ids.txt"
 
 session = requests.Session()
-
 session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -32,8 +32,6 @@ session.headers.update({
     )
 })
 
-seen = set()
-sent = set()
 
 NORWEGIAN_MONTHS = {
     "januar": 1,
@@ -55,6 +53,27 @@ def norway_today():
     return datetime.now(NORWAY_TZ).date()
 
 
+def load_sent_ids():
+    if not os.path.exists(SENT_FILE):
+        return set()
+
+    with open(SENT_FILE, "r", encoding="utf-8") as f:
+        return {
+            line.strip()
+            for line in f
+            if line.strip()
+        }
+
+
+def save_sent_id(ad_id):
+    with open(SENT_FILE, "a", encoding="utf-8") as f:
+        f.write(ad_id + "\n")
+        f.flush()
+
+
+sent = load_sent_ids()
+
+
 def get_ads():
     response = session.get(FINN_URL, timeout=20)
     response.raise_for_status()
@@ -64,7 +83,7 @@ def get_ads():
         response.text
     )
 
-    return list(dict.fromkeys(ids))[:100]
+    return list(dict.fromkeys(ids))
 
 
 def parse_updated_date(text):
@@ -97,32 +116,29 @@ def parse_updated_date(text):
     ).date()
 
 
-def is_private_seller(soup, text):
+def is_private_seller(text):
     text_lower = text.lower()
 
-    # Ja lapā skaidri redzam tirgotāja pazīmes, ignorējam.
+    # uzņēmuma/tirgotāja pazīmes
     dealer_markers = [
-        "forhandler",
-        "org.nr",
-        "organisasjonsnummer",
-        "bedrift",
+        "merkeforhandler",
         "bilforhandler",
+        "forhandler",
+        "organisasjonsnummer",
+        "org.nr",
+        "org nr",
     ]
 
     if any(marker in text_lower for marker in dealer_markers):
         return False
 
-    # FINN privātajiem sludinājumiem parasti ir Privat/Privat selger pazīmes.
+    # privātā pārdevēja pazīmes
     private_markers = [
-        "privat selger",
         "privat",
+        "privat selger",
     ]
 
-    if any(marker in text_lower for marker in private_markers):
-        return True
-
-    # Ja nav iespējams droši noteikt, NESŪTĀM.
-    return False
+    return any(marker in text_lower for marker in private_markers)
 
 
 def get_ad_info(ad_id):
@@ -159,12 +175,11 @@ def get_ad_info(ad_id):
             number = match.group(1)
             number = number.replace("\xa0", " ")
             number = re.sub(r"\s+", " ", number).strip()
-
             price = f"{number} kr"
             break
 
     updated_date = parse_updated_date(text)
-    private = is_private_seller(soup, text)
+    private = is_private_seller(text)
 
     return {
         "title": title,
@@ -200,65 +215,68 @@ def main():
             "BOT_TOKEN vai CHAT_ID nav uzstādīts Railway."
         )
 
+    today = norway_today()
+
+    # STARTĀ VISUS ŠODIENAS ESOŠOS SLUDINĀJUMUS
+    # IEGAUMĒJAM UN NESŪTĀM
     initial_ads = get_ads()
 
-    seen.update(initial_ads)
-    sent.update(initial_ads)
-
-    current_day = norway_today()
+    for ad_id in initial_ads:
+        if ad_id not in sent:
+            sent.add(ad_id)
+            save_sent_id(ad_id)
 
     send_telegram(
         "✅ FINN Auto Sniper palaists!\n\n"
         "🔎 Pārbaude ik pēc 2 sekundēm\n"
         "👤 Tikai privātie pārdevēji\n"
-        "📅 Tikai šodienas sludinājumi\n"
+        "📅 Tikai jauni šodienas sludinājumi\n"
         "💰 Cena līdz 200 000 kr"
     )
+
+    current_day = today
 
     while True:
         try:
             today = norway_today()
 
+            # ja sākusies jauna diena
             if today != current_day:
                 current_day = today
 
-                seen.clear()
-                sent.clear()
-
+                # pusnaktī visus tobrīd esošos iegaumējam,
+                # lai nepienāk veci auto
                 midnight_ads = get_ads()
 
-                seen.update(midnight_ads)
-                sent.update(midnight_ads)
+                for ad_id in midnight_ads:
+                    if ad_id not in sent:
+                        sent.add(ad_id)
+                        save_sent_id(ad_id)
 
             current_ads = get_ads()
 
-            new_ads = [
-                ad_id
-                for ad_id in current_ads
-                if ad_id not in seen
-                and ad_id not in sent
-            ]
+            for ad_id in current_ads:
 
-            seen.update(current_ads)
+                if ad_id in sent:
+                    continue
 
-            for ad_id in reversed(new_ads):
+                # REZERVĒJAM PIRMS apstrādes
+                # lai vienu ID nevar paņemt 2x
+                sent.add(ad_id)
+                save_sent_id(ad_id)
+
                 try:
-                    # REZERVĒJAM ID PIRMS jebkādas sūtīšanas.
-                    # Tas neļauj tam pašam ID aiziet 2x.
-                    sent.add(ad_id)
-
                     info = get_ad_info(ad_id)
 
-                    # Tikai šodienas
+                    # tikai šodien
                     if info["updated_date"] != today:
                         print(
-                            f"Ignorēts datums: {ad_id} | "
-                            f"{info['updated_date']}",
+                            f"Ignorēts vecs: {ad_id}",
                             flush=True
                         )
                         continue
 
-                    # Tikai privātie
+                    # tikai privātie
                     if not info["private"]:
                         print(
                             f"Ignorēts tirgotājs: {ad_id}",
